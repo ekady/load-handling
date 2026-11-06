@@ -3,6 +3,17 @@
 Hands-on experiments for learning how load balancing and load handling work, using
 Docker Compose + nginx as a reverse proxy.
 
+| # | Experiment | Config state |
+|---|---|---|
+| 1 | [Normal Round Robin](#experiment-1-normal-round-robin) | no `weight=` directives |
+| 2 | [Weighted Round Robin](#experiment-2-weighted-round-robin) | `weight=3, 1, 1` ← **current** |
+
+> **Note:** `nginx.conf` is mounted read-only into the container, so edits on the
+> host only take effect after a reload:
+> ```bash
+> docker exec load-balancer nginx -t && docker exec load-balancer nginx -s reload
+> ```
+
 ---
 
 ## Experiment 1: Normal Round Robin
@@ -88,6 +99,10 @@ http {
 }
 ```
 
+> The listing above is the **baseline** for Experiment 1. The file on disk is
+> currently in the Experiment 2 state (with `weight=` directives) — remove the
+> weights to run this experiment, then reload nginx.
+
 ### How it works
 
 1. `upstream backend_servers` defines the pool of backends. By default nginx uses
@@ -171,6 +186,123 @@ should rotate through the three nodes.
 3. **`host not found in upstream "web1"`** when running `nginx -t` outside the
    compose network — expected; the backend hostnames only resolve inside the
    compose network.
+
+---
+
+## Experiment 2: Weighted Round Robin
+
+**Goal:** Direct traffic to backends **proportionally to their capacity** instead
+of evenly, by assigning a `weight` to each server in the upstream pool.
+
+**Scenario:** web1 is a bigger machine (3× capacity), web2 and web3 are small
+(1× each) → weights `3 : 1 : 1`.
+
+### Code change
+
+Only the `upstream` block changes — everything else stays the same as Experiment 1:
+
+```nginx
+http {
+    upstream backend_servers {
+        server web1:80 weight=3;   # ← 60% of traffic
+        server web2:80 weight=1;   # ← 20% of traffic
+        server web3:80 weight=1;   # ← 20% of traffic
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            proxy_pass http://backend_servers;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+    }
+}
+```
+
+`weight` defaults to `1`, so Experiment 1's bare config is really `1 : 1 : 1`.
+
+### How it works
+
+- **Long-run share** of each backend = `weight / total weights`.
+  Here total = 3 + 1 + 1 = **5**, so web1 gets 3/5 = **60%**, web2 and web3
+  get 1/5 = **20%** each.
+- nginx uses **smooth** weighted round-robin: each server's slots are spread
+  across the cycle rather than clumped together (you get `1 · 1 · 2 · 1 · 3`,
+  not `1 · 1 · 1 · 2 · 3`), which avoids bursty traffic on the heavy backend.
+- The pattern **repeats every `sum of weights` requests** — here a cycle of 5.
+  Observed cycle (verified):
+
+  ```
+  cycle:   1  1  2  1  3  │ 1  1  2  1  3  │ 1  1  2  1  3
+             └──── 3 slots for web1 ────┘
+  ```
+
+  The exact interleaving depends on nginx's internal tie-breaking, but what is
+  guaranteed is the **proportion**: every cycle of 5 requests gives web1 three
+  slots, web2 one, web3 one. A window that doesn't line up with cycle
+  boundaries (e.g. `... 1 3 1 1 2 ...`) can also make web1 look adjacent —
+  that's the next cycle starting, not a different pattern.
+
+### Apply the change
+
+Edit `nginx.conf` on the host, then test + reload (no container restart needed):
+
+```bash
+docker exec load-balancer nginx -t && docker exec load-balancer nginx -s reload
+```
+
+### Observe the weighted distribution
+
+Sequence (15 requests = exactly 3 cycles):
+
+```bash
+for i in $(seq 1 15); do curl -s http://localhost:8080/; done | awk '{printf "%s ", $NF} END {print ""}'
+```
+
+Expected output:
+
+```
+1 1 2 1 3 1 1 2 1 3 1 1 2 1 3
+```
+
+Distribution:
+
+```bash
+for i in $(seq 1 15); do curl -s http://localhost:8080/; done | sort | uniq -c
+```
+
+Expected:
+
+```
+   9 Node web dari 1
+   3 Node web ini 3
+   3 Node web ini adalah 2
+```
+
+Which is exactly **3 : 1 : 1** → web1 **60%** (weight 3), web2 **20%**, web3 **20%**.
+
+### Experiment variations
+
+| Weights | Cycle length (sum) | web1 share |
+|---|---|---|
+| `1,1,1` (Experiment 1) | 3 | 33% |
+| `3,1,1` (this experiment) | 5 | 60% |
+| `6,2,2` | 10 | 60% |
+| `5,1,1` | 7 | 71% |
+
+The exact sequence grows with the weights, but the **proportions stay constant**:
+`share = weight / sum`.
+
+Related directives to explore later:
+
+- `least_conn` — send to the backend with the fewest active connections
+  (combines with `weight`, e.g. `server web1:80 weight=3 least_conn;`)
+- `ip_hash` — same client IP always hits the same backend (session persistence)
+- `backup`, `down` — mark a server as backup-only or administratively down
+
+---
 
 ### Tear down
 
