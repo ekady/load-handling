@@ -5,8 +5,9 @@ Docker Compose + nginx as a reverse proxy.
 
 | # | Experiment | Config state |
 |---|---|---|
-| 1 | [Normal Round Robin](#experiment-1-normal-round-robin) | no `weight=` directives |
-| 2 | [Weighted Round Robin](#experiment-2-weighted-round-robin) | `weight=3, 1, 1` ← **current** |
+| 1 | [Normal Round Robin](#experiment-1-normal-round-robin) | no `weight=` / balancing directives |
+| 2 | [Weighted Round Robin](#experiment-2-weighted-round-robin) | `weight=3, 1, 1` |
+| 3 | [IP Hashing](#experiment-3-ip-hashing) | `ip_hash;` ← **current** |
 
 > **Note:** `nginx.conf` is mounted read-only into the container, so edits on the
 > host only take effect after a reload:
@@ -100,8 +101,8 @@ http {
 ```
 
 > The listing above is the **baseline** for Experiment 1. The file on disk is
-> currently in the Experiment 2 state (with `weight=` directives) — remove the
-> weights to run this experiment, then reload nginx.
+> currently in the Experiment 3 state (with `ip_hash;`) — remove the balancing
+> directive to run this experiment, then reload nginx.
 
 ### How it works
 
@@ -299,8 +300,139 @@ Related directives to explore later:
 
 - `least_conn` — send to the backend with the fewest active connections
   (combines with `weight`, e.g. `server web1:80 weight=3 least_conn;`)
-- `ip_hash` — same client IP always hits the same backend (session persistence)
+- `ip_hash` — same client IP always hits the same backend → **see Experiment 3**
 - `backup`, `down` — mark a server as backup-only or administratively down
+
+---
+
+## Experiment 3: IP Hashing
+
+**Goal:** Make routing **sticky** — the same client always reaches the same
+backend, instead of rotating through them.
+
+**Scenario:** backends hold per-node state (user sessions, file uploads, a local
+cache). Round-robin would scatter one user's requests across three servers, and
+every request would miss the other nodes' state.
+
+### Code change
+
+Only one line in the `upstream` block (weights removed to isolate the experiment —
+`ip_hash` can be combined with `weight=`):
+
+```nginx
+http {
+    upstream backend_servers {
+        ip_hash;               # ← route by client IP instead of round-robin
+        server web1:80;
+        server web2:80;
+        server web3:80;
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            proxy_pass http://backend_servers;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+    }
+}
+```
+
+### How it works
+
+For each request nginx hashes the **client IP** and picks a slot:
+
+1. IPv4: only the **first three octets** are used — the last octet is *ignored*
+   (confirmed in nginx source: `iphp->addrlen = 3`). IPv6 uses all 16 bytes.
+2. `hash = 89;` then for each of the 3 bytes: `hash = (hash * 113 + byte) % 6271`
+3. `slot = hash % total_weight` → walk the server list by weight to that slot.
+
+Consequences:
+
+- **Same client → same backend, always** (sticky), as long as the pool is unchanged.
+- **Everyone on the same /24 network counts as one client.** All Docker containers
+  on one bridge network (e.g. `172.19.0.x`), an office LAN, or carrier NAT users
+  hash *identically* → they all land on a **single** backend.
+- Which backend a given IP lands on is an implementation detail — don't hardcode
+  expectations; they change with IPs, weights, and pool membership.
+
+### Apply the change
+
+Edit `nginx.conf`, then test + reload (no restart needed):
+
+```bash
+docker exec load-balancer nginx -t && docker exec load-balancer nginx -s reload
+```
+
+### Observe the stickiness
+
+**Same client, repeated requests** — all go to one node (here: always `3`):
+
+```bash
+for i in $(seq 1 9); do curl -s http://localhost:8080/; done | awk '{printf "%s ", $NF} END {print ""}'
+```
+
+```
+3 3 3 3 3 3 3 3 3
+```
+
+vs. Experiment 1's rotation `1 2 3 1 2 3 1 2 3`. The distribution check shows
+`9` for one node and nothing for the others.
+
+**Different client networks → spread.** Verified on this machine (hash computed
+by hand from the algorithm above first, then confirmed live):
+
+| Client | Source IP seen by nginx | Result |
+|---|---|---|
+| host browser/curl | `192.168.65.1` | → web3 |
+| container on `172.19.0.0/24` | `172.19.0.x` | → web3 |
+| container on `172.23.0.0/24` | `172.23.0.x` | → web2 |
+| container on `172.24.0.0/24` | `172.24.0.x` | → web1 |
+
+*(Your mapping will differ — your IPs hash differently. The invariant is:
+each client network is stuck to exactly one backend.)*
+
+Reproduce the multi-network part:
+
+```bash
+docker network create --subnet 172.23.0.0/24 net-a
+docker network create --subnet 172.24.0.0/24 net-b
+docker network connect net-a load-balancer
+docker network connect net-b load-balancer
+
+docker run --rm --network net-a curlimages/curl -s http://load-balancer/   # some node
+docker run --rm --network net-b curlimages/curl -s http://load-balancer/   # likely a different one
+docker run --rm --network load-handling_default curlimages/curl -s http://load-balancer/
+
+# cleanup
+docker network disconnect net-a load-balancer
+docker network disconnect net-b load-balancer
+docker network rm net-a net-b
+```
+
+> A neat side-effect you may notice: sequential `docker run --rm` containers get
+> the **same recycled IP** after the previous one exits — so they all map to the
+> same node. Run them concurrently (or on different networks) for distinct IPs.
+
+### Gotchas
+
+1. **Same /24 → one node.** ip_hash ignores the last octet, so an entire Docker
+   bridge subnet or office LAN piles onto **one** backend — the other two idle.
+   With NAT'd clients (corporate proxy, mobile carriers) many *different* users
+   share one IP and also collapse onto one node. If that node is hot, use
+   cookie-based stickiness instead.
+2. **Pool changes reshuffle most mappings.** Adding/removing a server rehashes
+   nearly everything — sticky sessions break. The alternative
+   `hash $remote_addr consistent;` (consistent hashing) only moves the clients
+   that must move.
+3. **Backend failure fails over.** If the assigned node is down/marked failed,
+   nginx tries other peers (up to 20 tries) — clients get routed elsewhere until
+   it recovers, then snap back.
+4. **IP changes break stickiness too** — DHCP/mobile re-addressing moves a client
+   to a different node; anything truly per-user should live in a real session
+   store (Redis/DB), with ip_hash only as a caching optimization.
 
 ---
 
