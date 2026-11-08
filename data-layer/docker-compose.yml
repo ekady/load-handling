@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  mysql-primary:
+    image: mysql:8.0
+    container_name: mysql-primary
+    environment:
+      - MYSQL_ROOT_PASSWORD=my-secret-pw
+    command: --server-id=1 --log-bin=mysql-bin --binlog-format=ROW
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./init-data.sql:/docker-entrypoint-initdb.d/init-data.sql
+    
+  mysql-replica:
+    image: mysql:8.0
+    container_name: mysql-replica
+    environment:
+      - MYSQL_ROOT_PASSWORD=my-secret-pw
+    command: --server-id=2 --read-only=1
+    ports:
+      - "3307:3306"
+    depends_on:
+      - mysql-primary
+
+  mongodb:
+    image: mongo:5.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+
+  app-client:
+    image: python:3.9
+    container_name: app-client
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: /bin/sh -c "pip install mysql-connector-python pymongo && tail -f /dev/null"
+    depends_on:
+      - mysql-primary
+      - mysql-replica
+      - mongodb

@@ -7,7 +7,8 @@ Docker Compose + nginx as a reverse proxy.
 |---|---|---|
 | 1 | [Normal Round Robin](#experiment-1-normal-round-robin) | no `weight=` / balancing directives |
 | 2 | [Weighted Round Robin](#experiment-2-weighted-round-robin) | `weight=3, 1, 1` |
-| 3 | [IP Hashing](#experiment-3-ip-hashing) | `ip_hash;` ← **current** |
+| 3 | [IP Hashing](#experiment-3-ip-hashing) | `ip_hash;` |
+| 4 | [Failure Handling: `max_fails`](#experiment-4-failure-handling-max_fails--fail_timeout) | `weight=` + `max_fails=` / `fail_timeout=` ← **current** |
 
 > **Note:** `nginx.conf` is mounted read-only into the container, so edits on the
 > host only take effect after a reload:
@@ -101,8 +102,8 @@ http {
 ```
 
 > The listing above is the **baseline** for Experiment 1. The file on disk is
-> currently in the Experiment 3 state (with `ip_hash;`) — remove the balancing
-> directive to run this experiment, then reload nginx.
+> currently in the Experiment 4 state (weights + `max_fails`/`fail_timeout`)
+> — remove the balancing directives to run this experiment, then reload nginx.
 
 ### How it works
 
@@ -433,6 +434,150 @@ docker network rm net-a net-b
 4. **IP changes break stickiness too** — DHCP/mobile re-addressing moves a client
    to a different node; anything truly per-user should live in a real session
    store (Redis/DB), with ip_hash only as a caching optimization.
+
+---
+
+## Experiment 4: Failure Handling: `max_fails` / `fail_timeout`
+
+**Goal:** Understand what nginx does when a backend dies — when it stops using
+it, when it retries, and what the client actually experiences.
+
+**Scenario:** stop one backend mid-traffic (`docker stop web2`) and measure
+every request instead of just watching the browser.
+
+### Code change
+
+Per-server failure directives in the `upstream` block (balancing directives
+commented out to isolate the experiment):
+
+```nginx
+http {
+    upstream backend_servers {
+        # ip_hash; # Use ip_hash for session persistence
+        # least_conn; # Use least_conn for load balancing based on the least number of connections
+        server web1:80 weight=3 max_fails=3 fail_timeout=10s;
+        server web2:80 weight=1 max_fails=2 fail_timeout=30s;
+        server web3:80 weight=1 max_fails=1 fail_timeout=5s;
+    }
+    ...
+}
+```
+
+### What `max_fails` and `fail_timeout` do
+
+```nginx
+server web2:80 max_fails=2 fail_timeout=3s;
+```
+
+1. nginx counts **consecutive failures** (connect errors, timeouts) per backend.
+2. When the count reaches `max_fails` → the backend enters a **penalty box: it is
+   skipped for the next `fail_timeout` seconds**.
+3. When `fail_timeout` expires → the backend becomes eligible **again — forever,
+   by design**, because nginx must periodically re-probe it to notice it
+   recovered.
+
+Key implications:
+
+- `max_fails=2` does **not** mean "stop using it after 2 tries." It means
+  *"skip for `fail_timeout`, probe again, skip, probe again…"* — slow probe
+  requests continue for as long as the backend is down.
+- `fail_timeout` is both the **penalty duration** *and* the **recovery-probe
+  interval**.
+- Defaults (if omitted): `max_fails=1 fail_timeout=10s`.
+- `max_fails=0` = never consider it failed (always try it).
+
+### The experiment
+
+```bash
+docker stop web2
+# time every request instead of eyeballing the browser:
+for i in $(seq 1 16); do
+  curl -s --max-time 70 -o /tmp/b.txt -w "%{time_total} %{http_code} " http://localhost:8080/
+  printf '%s node=%s\n' "$(date +%T)" "$(awk '{printf "%s", $NF}' /tmp/b.txt)"
+  sleep 1
+done
+docker logs load-balancer --since 5m   # watch connect errors
+```
+
+**Measured result** (web2 stopped, `fail_timeout=3s` at the time):
+
+```
+20:07:42  web2 stopped
+request 1:    38.85s  → 200 node=1     ← first probe (web2 still "healthy")
+requests 2-7: ~0.004s → 200            ← web2 in penalty box ✓
+request 8:     3.07s  → 200 node=1     ← probe after fail_timeout elapsed
+requests 9-15: ~0.004s → 200           ← penalty box ✓
+request 16:    3.12s  → 200 node=1     ← probe again
+```
+
+Error log shows exactly the 3 stalls:
+
+```
+13:08:21 connect() failed (113: Host is unreachable) ... upstream: "http://172.19.0.4:80/"
+13:08:31 connect() failed (113: Host is unreachable)
+13:08:43 connect() failed (113: Host is unreachable)
+```
+
+Everything else is sub-5ms and web2 never appears in responses — **the mechanism
+works**. The three findings below are why it can *feel* broken.
+
+### Finding 1 — you cannot reload while a backend is down
+
+```
+$ docker exec load-balancer nginx -t
+nginx: [emerg] host not found in upstream "web2:80" in /etc/nginx/nginx.conf:10
+```
+
+nginx resolves static upstream names **at config-load time**, and Docker's DNS
+**stops resolving a stopped container's name**. So while web2 is down, every
+`nginx -t` / reload fails → the running config (and its failure counters) stay
+exactly as they were. Start the backend first, or comment its `server` line out
+before reloading.
+
+> Related: a **successful** reload spawns fresh workers → all failure counters
+> reset to zero. Reloading repeatedly while testing wipes the state you're
+> observing.
+
+### Finding 2 — each failure is slow
+
+nginx waits for the TCP connect to the dead IP before counting a failure:
+
+- Nothing answers ARP → kernel gives up after **~3s** (`EHOSTUNREACH` /
+  `connect() failed (113)`); the first attempt after death retransmitted for
+  **~39s** in our test.
+- nginx's own ceiling: `proxy_connect_timeout` defaults to **60 seconds**.
+
+So one probe cycle ≈ `fail_timeout` (skip) + connect-failure time → with
+`fail_timeout=3s`, roughly **one slow request every ~6 seconds** — far more
+"slow loads" than `max_fails=2` suggests. Fix: `proxy_connect_timeout 1s;` in
+the `server`/`location` block, and/or a larger `fail_timeout`.
+
+### Finding 3 — failures are masked as `200 OK`
+
+Default `proxy_next_upstream` includes `error timeout`: after web2's connect
+fails, nginx **silently retries the same request on the next healthy server**.
+The browser sees a slow-but-successful response — never an error page. To
+observe failures at all, use `curl -w '%{time_total}'` timing or the error log.
+
+### Remedies
+
+| Goal | Fix |
+|---|---|
+| Failures detectable in ~1s instead of 3–39s | `proxy_connect_timeout 1s;` (in `server`/`location`, not `upstream`) |
+| Fewer slow probes | Raise `fail_timeout` (e.g. `30s` → one probe per ~30s; trade-off: slower recovery detection) |
+| Backend fully out of rotation, no probes | Comment out its `server` line, then reload (do this **before** stopping it, or start it again to reload) |
+| Never skip — always try | `max_fails=0` |
+| See failures in tests | Timed `curl` or `docker logs load-balancer` (responses are retried → always 200) |
+| Instant failover without slow client requests | Active health checks — not available in open-source nginx (nginx Plus, Lua/njs, external tools) |
+
+### Restore
+
+```bash
+docker start web2
+docker exec load-balancer nginx -t && docker exec load-balancer nginx -s reload
+```
+
+*(Reloading after the backend returns also resets all failure counters.)*
 
 ---
 
