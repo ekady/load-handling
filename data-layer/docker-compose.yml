@@ -6,6 +6,7 @@ services:
     container_name: mysql-primary
     environment:
       - MYSQL_ROOT_PASSWORD=my-secret-pw
+      - MYSQL_DATABASE=chat_db
     command: --server-id=1 --log-bin=mysql-bin --binlog-format=ROW
     ports:
       - "3306:3306"
@@ -17,9 +18,12 @@ services:
     container_name: mysql-replica
     environment:
       - MYSQL_ROOT_PASSWORD=my-secret-pw
+      - MYSQL_DATABASE=chat_db
     command: --server-id=2 --read-only=1
     ports:
       - "3307:3306"
+    volumes: 
+    - ./init-data.sql:/docker-entrypoint-initdb.d/init-data.sql
     depends_on:
       - mysql-primary
 
